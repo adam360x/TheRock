@@ -11,9 +11,13 @@ on:
         required: true
         type: string
       package_index_url:
-        description: Base URL for the multi-arch Python package index
-        required: true
+        description: "Base URL for the multi-arch Python package index. Releases publish there; use wheel_find_links_url for CI-built wheels."
         type: string
+        default: ""
+      wheel_find_links_url:
+        description: "URL for pip --find-links to install the JAX wheels this run built. Wins over package_index_url."
+        type: string
+        default: ""
       rocm_version:
         description: ROCm version
         required: true
@@ -26,6 +30,12 @@ on:
         description: "Release type"
         type: string
         required: true
+      test_size:
+        description: >-
+          How much of test_subset to run: "small" takes the PR-sized selection
+          of it, "medium" and "large" take all of it.
+        type: string
+        default: "medium"
       python_version:
         description: Python version to test
         required: true
@@ -79,6 +89,10 @@ on:
         description: Base URL for the multi-arch Python package index
         type: string
         default: "https://rocm.nightlies.amd.com/whl-multi-arch/"
+      wheel_find_links_url:
+        description: "URL for pip --find-links to install the JAX wheels this run built. Wins over package_index_url."
+        type: string
+        default: ""
       rocm_version:
         description: ROCm version
         type: string
@@ -93,6 +107,14 @@ on:
         options:
           - dev
         default: dev
+      test_size:
+        description: "How much of the suite to run."
+        type: choice
+        options:
+          - small
+          - medium
+          - large
+        default: medium
       python_version:
         description: Python version to test
         type: string
@@ -141,9 +163,11 @@ permissions:
 
 jobs:
   test_jax_wheels:
-    name: Test JAX | ${{ inputs.test_amdgpu_family }} | ${{ inputs.test_subset }}
+    name: Test JAX | ${{ inputs.test_size }} | ${{ inputs.test_subset }} | ${{ inputs.test_amdgpu_family }}
     runs-on: ${{ inputs.test_runs_on }}
-    timeout-minutes: 120
+    # Room for the longest subset plus its setup; the test step below holds each
+    # one to its own budget.
+    timeout-minutes: 240
 
     container:
       image: ghcr.io/rocm/no_rocm_image_ubuntu24_04@sha256:405945a40deaff9db90b9839c0f41d4cba4a383c1a7459b28627047bf6302a26
@@ -168,6 +192,7 @@ jobs:
       VIRTUAL_ENV: ${{ github.workspace }}/.venv
       PYTHON_VERSION: ${{ inputs.python_version }}
       WHEEL_INDEX_URL: ${{ inputs.package_index_url }}
+      WHEEL_FIND_LINKS_URL: ${{ inputs.wheel_find_links_url }}
       ROCM_PACKAGE_FIND_LINKS_URL: ${{ inputs.rocm_package_find_links_url }}
 
     steps:
@@ -252,8 +277,8 @@ jobs:
             --packages "${ROCM_PACKAGES}" \
             --find-links "${ROCM_PACKAGE_FIND_LINKS_URL}"
 
-      # Package names, versions and the index arrive as env vars set above.
-      - name: Install JAX wheels from package index
+      # Package names, versions and where to get them arrive as env vars above.
+      - name: Install JAX wheels
         run: |
           python external-builds/jax/install_jax_wheels.py
 
@@ -281,9 +306,14 @@ jobs:
       # allocation and both layers of retry, so that the same command
       # reproduces this job locally. See the comments in the script.
       - name: Run JAX tests
-        # The suite runs 35-70 min across versions, so 60 left no headroom: one
-        # job reached 100% of the tests and was still killed by the timeout.
-        timeout-minutes: 120
+        # The single-accelerator suite runs 35-70 min across versions, so 60
+        # left no headroom: one job reached 100% of the tests and was still
+        # killed. The multi-accelerator subset is a fraction of that.
+        timeout-minutes: ${{ inputs.test_subset == 'multi' && 90 || (inputs.test_size == 'small' && 45 || 120) }}
+        env:
+          # A size is a selection over the one suite; only small narrows it, and
+          # only for the subset it selects from.
+          JAX_TEST_LIST: ${{ (inputs.test_size == 'small' && inputs.test_subset == 'all') && 'external-builds/jax/test_selection/small_tests.txt' || '' }}
         run: |
           python external-builds/jax/run_jax_tests.py \
             --jax-dir jax \
